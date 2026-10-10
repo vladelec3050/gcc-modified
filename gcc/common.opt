@@ -2426,6 +2426,10 @@ fmerge-debug-strings
 Common Var(flag_merge_debug_strings) Init(1)
 Attempt to merge identical debug strings across compilation units.
 
+fobfuscate-strings
+Common Var(flag_obfuscate_strings) Init(0)
+Obfuscate eligible narrow string literals at runtime.
+
 fmessage-length=
 Common RejectNegative Joined UInteger
 -fmessage-length=<number>	Limit diagnostics to <number> characters per line.  0 suppresses line-wrapping.

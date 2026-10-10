@@ -14050,6 +14050,25 @@ GCC enables this option by default.  If you want to force the compiler to
 check if a variable is referenced, regardless of whether or not
 optimization is turned on, use the @option{-fno-keep-static-consts} option.
 
+@opindex fobfuscate-strings
+@opindex fno-obfuscate-strings
+@item -fobfuscate-strings
+Obfuscate selected @code{char} and @code{wchar_t} string literals passed
+directly as arguments to ordinary function calls.  The implementation also
+handles literal addresses in compiler-generated static initializer-list
+backing arrays used by runtime calls.  GCC stores encrypted target bytes in
+the program and decodes them during program initialization.  This can cover
+uses such as @code{std::string}, @code{std::wstring}, and standard containers
+initialized from string literals, without depending on library names.  It is
+intended to make casual plaintext searches less effective; it is not
+cryptographic protection.
+
+Indirect calls, variadic arguments, arbitrary user-declared constant
+initializers, and literals used outside the supported call contexts are not
+transformed.  UTF string types other than @code{wchar_t} are unsupported.
+Decoded buffers have static lifetime, and programs which inspect literal
+pointer identity may observe different behavior.
+
 @opindex fmerge-constants
 @opindex fno-merge-constants
 @item -fmerge-constants

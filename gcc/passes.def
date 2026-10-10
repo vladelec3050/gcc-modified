@@ -43,6 +43,7 @@ along with GCC; see the file COPYING3.  If not see
   NEXT_PASS (pass_coroutine_early_expand_ifns);
   NEXT_PASS (pass_expand_omp);
   NEXT_PASS (pass_build_cgraph_edges);
+  NEXT_PASS (pass_obfuscate_strings);
   TERMINATE_PASS_LIST (all_lowering_passes)
 
   /* Interprocedural optimization passes.  */
@@ -50,6 +51,7 @@ along with GCC; see the file COPYING3.  If not see
   /* auto_profile_offline uses dwarf_name hook that only
      works before free_lang_data.  */
   NEXT_PASS (pass_ipa_auto_profile_offline);
+  NEXT_PASS (pass_obfuscate_strings_ipa);
   NEXT_PASS (pass_ipa_free_lang_data);
   NEXT_PASS (pass_ipa_function_and_variable_visibility);
   NEXT_PASS (pass_ipa_strub_mode);

@@ -1758,6 +1758,7 @@ OBJS = \
 	sancov.o \
 	simple-diagnostic-path.o \
 	tree-assume.o \
+	tree-obfuscate-strings.o \
 	tree-call-cdce.o \
 	tree-cfg.o \
 	tree-cfgcleanup.o \
@@ -3137,6 +3138,7 @@ GTFILES = $(CPPLIB_H) $(srcdir)/input.h $(srcdir)/coretypes.h \
   $(srcdir)/ctfout.cc \
   $(srcdir)/btfout.cc \
   $(srcdir)/tree-vect-generic.cc \
+  $(srcdir)/tree-obfuscate-strings.cc \
   $(srcdir)/gimple-isel.cc \
   $(srcdir)/dojump.cc $(srcdir)/emit-rtl.h \
   $(srcdir)/emit-rtl.cc $(srcdir)/except.h $(srcdir)/explow.cc $(srcdir)/expr.cc \
