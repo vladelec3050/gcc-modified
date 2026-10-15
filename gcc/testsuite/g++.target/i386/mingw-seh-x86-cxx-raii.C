@@ -18,4 +18,4 @@ seh_with_raii ()
     {
     }
 }
-/* { dg-error "__try.*not yet supported in C\+\+" "" { target *-*-* } .-9 } */
+/* { dg-error "C\+\+ cleanup, exception handling, and non-local control flow" "" { target *-*-* } .-1 } */

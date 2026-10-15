@@ -20747,6 +20747,29 @@ add_return_star_this_fixit (gcc_rich_location *richloc, tree fndecl)
 				       indent);
 }
 
+/* Return a cleanup or language-EH node in a function that also contains a
+   source-level native SEH scope.  Such a function needs a composed Windows
+   unwind personality before it can be emitted safely.  */
+
+static tree
+cp_mingw_seh_find_cleanup (tree *tp, int *, void *)
+{
+  if (!*tp)
+    return NULL_TREE;
+  switch (TREE_CODE (*tp))
+    {
+    case CLEANUP_STMT:
+    case TRY_FINALLY_EXPR:
+    case TRY_CATCH_EXPR:
+    case TRY_BLOCK:
+    case EH_SPEC_BLOCK:
+    case THROW_EXPR:
+      return *tp;
+    default:
+      return NULL_TREE;
+    }
+}
+
 /* Finish up a function declaration and compile that function
    all the way to assembler language output.  The free the storage
    for the function definition. INLINE_P is TRUE if we just
@@ -20832,6 +20855,23 @@ finish_function (bool inline_p)
 
   /* If we're saving up tree structure, tie off the function now.  */
   DECL_SAVED_TREE (fndecl) = pop_stmt_list (DECL_SAVED_TREE (fndecl));
+
+  if (lookup_attribute ("mingw_seh_scope", DECL_ATTRIBUTES (fndecl))
+      && walk_tree (&DECL_SAVED_TREE (fndecl), cp_mingw_seh_find_cleanup,
+		    NULL, NULL))
+    {
+      error_at (DECL_SOURCE_LOCATION (fndecl),
+		"native Microsoft SEH cannot yet be combined with C++ cleanup or "
+		"language exception handling in the same function");
+      tree *attr = &DECL_ATTRIBUTES (fndecl);
+      while (*attr)
+	{
+	  if (is_attribute_p ("mingw_seh_scope", TREE_PURPOSE (*attr)))
+	    *attr = TREE_CHAIN (*attr);
+	  else
+	    attr = &TREE_CHAIN (*attr);
+	}
+    }
 
   finish_fname_decls ();
 

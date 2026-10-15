@@ -14339,6 +14339,500 @@ cp_parser_handle_directive_omp_attributes (cp_parser *parser, tree *pattrs,
   Note that this version of parsing restricts assertions to be attached to
   empty statements. */
 
+/* Add an inline-assembly marker for a Microsoft SEH scope boundary.  */
+
+static void
+cp_parser_add_mingw_seh_asm (location_t loc, const char *text,
+			    tree clobbers = NULL_TREE, tree labels = NULL_TREE)
+{
+  tree stmt = finish_asm_stmt (loc, labels != NULL_TREE, build_string
+			       (strlen (text), text), NULL_TREE, NULL_TREE,
+			       clobbers, labels, false, false);
+  (void) stmt;
+}
+
+/* Keep automatic objects read by a Windows-entered handler in memory.  */
+
+static tree
+cp_mingw_seh_mark_handler_local (tree *tp, int *walk_subtrees, void *data)
+{
+  tree t = *tp;
+  tree function = (tree) data;
+  if (IS_TYPE_OR_DECL_P (t))
+    {
+      if ((TREE_CODE (t) == VAR_DECL || TREE_CODE (t) == PARM_DECL)
+	  && DECL_CONTEXT (t) == function && !TREE_STATIC (t) && TREE_USED (t))
+	{
+	  TREE_ADDRESSABLE (t) = 1;
+	  if (!lookup_attribute ("mingw_seh_handler_local", DECL_ATTRIBUTES (t)))
+	    DECL_ATTRIBUTES (t)
+	      = tree_cons (get_identifier ("mingw_seh_handler_local"), NULL_TREE,
+		   DECL_ATTRIBUTES (t));
+	}
+      *walk_subtrees = 0;
+    }
+  return NULL_TREE;
+}
+
+/* After diagnosing an unsupported SEH form, consume its complete trailing
+   clause so __except does not become a spurious identifier statement.  */
+
+static void
+cp_parser_mingw_seh_skip_clause (cp_parser *parser)
+{
+  cp_token *clause = cp_lexer_peek_token (parser->lexer);
+  bool is_except
+    = (clause->type == CPP_KEYWORD && clause->keyword == RID_SEH_EXCEPT)
+      || (clause->type == CPP_NAME && id_equal (clause->u.value, "__except"));
+  bool is_finally
+    = (clause->type == CPP_KEYWORD && clause->keyword == RID_SEH_FINALLY)
+      || (clause->type == CPP_NAME && id_equal (clause->u.value, "__finally"));
+  if (!is_except && !is_finally)
+    return;
+  cp_lexer_consume_token (parser->lexer);
+  if (is_except)
+    cp_parser_skip_to_end_of_balanced_tokens (parser);
+  cp_parser_skip_to_end_of_block_or_statement (parser);
+}
+
+/* Return nonnull for C++ constructs whose required language cleanups or
+   personality cannot yet be represented together with __C_specific_handler.  */
+
+static tree
+cp_mingw_seh_find_language_cleanup (tree *tp, int *, void *)
+{
+  if (!*tp)
+    return NULL_TREE;
+  switch (TREE_CODE (*tp))
+    {
+    case CLEANUP_STMT:
+    case TRY_FINALLY_EXPR:
+    case TRY_CATCH_EXPR:
+    case EH_SPEC_BLOCK:
+    case THROW_EXPR:
+      return *tp;
+    default:
+      return NULL_TREE;
+  }
+}
+
+static tree
+cp_mingw_seh_find_unsafe_x86_stmt (tree *tp, int *walk_subtrees, void *)
+{
+  if (!*tp)
+    return NULL_TREE;
+  switch (TREE_CODE (*tp))
+    {
+    case CLEANUP_STMT:
+    case TRY_FINALLY_EXPR:
+    case TRY_CATCH_EXPR:
+    case EH_SPEC_BLOCK:
+    case THROW_EXPR:
+    case RETURN_EXPR:
+    case BREAK_STMT:
+    case CONTINUE_STMT:
+      *walk_subtrees = 0;
+      return *tp;
+    case GOTO_EXPR:
+      /* The compiler's synthetic branch around the handler is safe; reject
+	 user gotos from a protected region because x86 must unregister the frame
+	 before leaving it.  */
+      if (TREE_CODE (TREE_OPERAND (*tp, 0)) == LABEL_DECL
+	  && DECL_ARTIFICIAL (TREE_OPERAND (*tp, 0)))
+	return NULL_TREE;
+      *walk_subtrees = 0;
+      return *tp;
+    default:
+      return NULL_TREE;
+    }
+}
+
+static tree
+cp_parser_mingw_seh_runtime_decl (location_t loc, const char *name,
+				  tree result_type, int nargs)
+{
+  static tree register_decl;
+  static tree unregister_decl;
+  tree *cached = !strcmp (name, "__mingw_seh_register")
+    ? &register_decl : &unregister_decl;
+  if (*cached)
+    return *cached;
+  tree arg_types = NULL_TREE;
+  for (int i = 0; i < nargs; ++i)
+    arg_types = tree_cons (NULL_TREE, ptr_type_node, arg_types);
+  if (nargs >= 2)
+    TREE_VALUE (TREE_CHAIN (arg_types)) = integer_type_node;
+  arg_types = nreverse (arg_types);
+  tree type = build_function_type (result_type, arg_types);
+  tree decl = build_decl (loc, FUNCTION_DECL, get_identifier (name), type);
+  DECL_EXTERNAL (decl) = 1;
+  TREE_PUBLIC (decl) = 1;
+  DECL_ARTIFICIAL (decl) = 1;
+  TREE_USED (decl) = 1;
+  retrofit_lang_decl (decl);
+  SET_DECL_LANGUAGE (decl, lang_c);
+  *cached = pushdecl_top_level (decl);
+  return *cached;
+}
+
+/* The x86 registration ABI has no unwind funclets.  Support C++ only when
+   the protected/handler statements need no C++ cleanup or non-local jump.  */
+
+static tree
+cp_parser_mingw_seh_try_statement_x86 (cp_parser *parser, location_t loc)
+{
+  if (processing_template_decl)
+    {
+      error_at (loc, "MinGW x86 SEH in C++ templates is not yet supported");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      return error_mark_node;
+    }
+
+  tree compound = begin_compound_stmt (0);
+  tree protected_list = push_stmt_list ();
+  cp_parser_compound_statement (parser, NULL, BCS_NORMAL, false);
+  protected_list = pop_stmt_list (protected_list);
+
+  cp_token *clause = cp_lexer_peek_token (parser->lexer);
+  bool except_clause
+    = (clause->type == CPP_KEYWORD && clause->keyword == RID_SEH_EXCEPT)
+      || (clause->type == CPP_NAME && id_equal (clause->u.value, "__except"));
+  if (!except_clause)
+    {
+      error_at (clause->location,
+		"expected %<__except%> after %<__try%> block");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      finish_compound_stmt (compound);
+      return error_mark_node;
+    }
+  cp_lexer_consume_token (parser->lexer);
+
+  matching_parens parens;
+  tree expr = error_mark_node;
+  if (parens.require_open (parser))
+    {
+      expr = cp_parser_expression (parser);
+      parens.require_close (parser);
+    }
+  if (expr != error_mark_node)
+    expr = fold (expr);
+  if (expr == error_mark_node || TREE_CODE (expr) != INTEGER_CST
+      || !tree_fits_shwi_p (expr) || !IN_RANGE (tree_to_shwi (expr), -1, 1))
+    {
+      error_at (loc, "the initial MinGW x86 C++ SEH implementation requires "
+		"a constant filter result of -1, 0, or 1");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      finish_compound_stmt (compound);
+      return error_mark_node;
+    }
+
+  static unsigned int label_number;
+  char internal[128];
+  ASM_GENERATE_INTERNAL_LABEL (internal, "SEH_X86_HANDLER", ++label_number);
+  const char *handler = ggc_strdup (internal + (internal[0] == '*'));
+  tree handler_name = get_identifier (handler + (handler[0] == '.'));
+  tree handler_label = lookup_label (handler_name);
+  TREE_USED (handler_label) = 1;
+  FORCED_LABEL (handler_label) = 1;
+  tree after_label = create_artificial_label (loc);
+  FORCED_LABEL (after_label) = 1;
+  tree handler_list = push_stmt_list ();
+  cp_parser_compound_statement (parser, NULL, BCS_NORMAL, false);
+  handler_list = pop_stmt_list (handler_list);
+  walk_tree (&handler_list, cp_mingw_seh_mark_handler_local,
+	     current_function_decl, NULL);
+
+  bool unsafe
+    = (walk_tree (&protected_list, cp_mingw_seh_find_unsafe_x86_stmt,
+		  NULL, NULL)
+       || walk_tree (&handler_list, cp_mingw_seh_find_unsafe_x86_stmt,
+		     NULL, NULL));
+  if (unsafe)
+    error_at (loc, "C++ cleanup, exception handling, and non-local control "
+	      "flow are not supported inside MinGW x86 %<__try%>");
+
+  tree options = NULL_TREE;
+  const char *option_names[] = { "no-reorder-blocks",
+				 "no-reorder-blocks-and-partition",
+				 "no-omit-frame-pointer" };
+  for (unsigned i = 0; i < ARRAY_SIZE (option_names); ++i)
+    options = tree_cons (NULL_TREE,
+			 build_string (strlen (option_names[i]), option_names[i]),
+			 options);
+  decl_attributes (&current_function_decl,
+		   tree_cons (get_identifier ("optimize"), nreverse (options),
+			      NULL_TREE), 0);
+  DECL_UNINLINABLE (current_function_decl) = 1;
+  decl_attributes (&current_function_decl,
+		   tree_cons (get_identifier ("noclone"), NULL_TREE, NULL_TREE), 0);
+
+  tree frame_type = build_array_type_nelts (unsigned_char_type_node, 24);
+  tree frame = create_temporary_var (frame_type);
+  DECL_NAME (frame) = get_identifier ("seh_registration");
+  frame = pushdecl (frame);
+  TREE_ADDRESSABLE (frame) = 1;
+  tree frame_address = fold_convert
+    (ptr_type_node,
+     build1 (ADDR_EXPR, build_pointer_type (frame_type), frame));
+  tree input = tree_cons (build_tree_list (NULL_TREE, build_string (1, "r")),
+			  frame_address, NULL_TREE);
+  tree memory = tree_cons (NULL_TREE, build_string (6, "memory"), NULL_TREE);
+  const char *save_text = "movl %%esp, 16(%0)\n\tmovl %%ebp, 20(%0)";
+  tree stmt_list = push_stmt_list ();
+  add_decl_expr (frame);
+  finish_asm_stmt (loc, 1, build_string (strlen (save_text), save_text),
+		   NULL_TREE, input, memory, NULL_TREE, false, false);
+
+  tree register_decl = cp_parser_mingw_seh_runtime_decl
+    (loc, "__mingw_seh_register", void_type_node, 3);
+  tree unregister_decl = cp_parser_mingw_seh_runtime_decl
+    (loc, "__mingw_seh_unregister", void_type_node, 1);
+  add_stmt (build_call_expr_loc
+	    (loc, register_decl, 3, frame_address,
+     build_int_cst (integer_type_node, tree_to_shwi (expr)),
+     fold_convert (ptr_type_node, build1 (ADDR_EXPR, ptr_type_node,
+						  handler_label))));
+  add_stmt (protected_list);
+  add_stmt (build_call_expr_loc (loc, unregister_decl, 1, frame_address));
+
+  tree labels = tree_cons (build_string (11, "seh_handler"), handler_label,
+			  NULL_TREE);
+  const char *edge_text = "jmp 1f\n\tjmp %l[seh_handler]\n1:";
+  const char *clobber_names[] = { "eax", "ecx", "edx", "memory" };
+  tree clobbers = NULL_TREE;
+  for (unsigned i = 0; i < ARRAY_SIZE (clobber_names); ++i)
+    clobbers = tree_cons (NULL_TREE,
+			  build_string (strlen (clobber_names[i]),
+					clobber_names[i]), clobbers);
+  finish_asm_stmt (loc, 0, build_string (strlen (edge_text), edge_text),
+		   NULL_TREE, NULL_TREE, nreverse (clobbers), labels,
+		   false, false);
+  add_stmt (build_stmt (loc, GOTO_EXPR, after_label));
+  finish_label_stmt (handler_name);
+  add_stmt (handler_list);
+  add_stmt (build_stmt (loc, LABEL_EXPR, after_label));
+  stmt_list = pop_stmt_list (stmt_list);
+  add_stmt (stmt_list);
+  finish_compound_stmt (compound);
+  return compound;
+}
+
+/* Parse the C++ form of a MinGW x64 __try/__except statement.  The C++
+   frontend rejects cleanup and language-EH trees before attaching native
+   scope metadata until those unwind personalities can be composed safely.  */
+
+static tree
+cp_parser_mingw_seh_try_statement (cp_parser *parser, location_t loc)
+{
+  if (!flag_ms_extensions)
+    {
+      error_at (loc, "%<__try%> requires %<-fms-extensions%>");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      return error_mark_node;
+    }
+#ifdef TARGET_SEH_X86
+  if (TARGET_PECOFF && TARGET_SEH_X86)
+    return cp_parser_mingw_seh_try_statement_x86 (parser, loc);
+#endif
+  if (!TARGET_SEH || !TARGET_64BIT || processing_template_decl)
+    {
+      error_at (loc, "%<__try%> in C++ is currently supported only in "
+		"non-template MinGW x64 functions");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      return error_mark_node;
+    }
+
+  static unsigned int label_number;
+  char label_buf[4][96];
+  const char *prefixes[] = { "SEH_BEGIN", "SEH_END", "SEH_FILTER",
+			     "SEH_HANDLER" };
+  for (unsigned i = 0; i < 4; ++i)
+    {
+      char internal[128];
+      ASM_GENERATE_INTERNAL_LABEL (internal, prefixes[i], ++label_number);
+      strcpy (label_buf[i], internal + (internal[0] == '*'));
+    }
+  const char *begin = ggc_strdup (label_buf[0]);
+  const char *end = ggc_strdup (label_buf[1]);
+  const char *filter = ggc_strdup (label_buf[2]);
+  const char *handler = ggc_strdup (label_buf[3]);
+
+  tree compound = begin_compound_stmt (0);
+  char asm_text[160];
+  snprintf (asm_text, sizeof (asm_text), "%s:", begin);
+  cp_parser_add_mingw_seh_asm (loc, asm_text,
+			       tree_cons (NULL_TREE, build_string (6, "memory"),
+					  NULL_TREE));
+  cp_parser_compound_statement (parser, NULL, BCS_NORMAL, false);
+  snprintf (asm_text, sizeof (asm_text), "%s:", end);
+  cp_parser_add_mingw_seh_asm (loc, asm_text,
+			       tree_cons (NULL_TREE, build_string (6, "memory"),
+					  NULL_TREE));
+
+  cp_token *clause = cp_lexer_peek_token (parser->lexer);
+  bool except_clause
+    = (clause->type == CPP_KEYWORD && clause->keyword == RID_SEH_EXCEPT)
+      || (clause->type == CPP_NAME && id_equal (clause->u.value, "__except"));
+  if (!except_clause)
+    {
+      error_at (clause->location,
+		"expected %<__except%> after %<__try%> block");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      finish_compound_stmt (compound);
+      return error_mark_node;
+    }
+  cp_lexer_consume_token (parser->lexer);
+
+  matching_parens parens;
+  tree expr = error_mark_node;
+  if (parens.require_open (parser))
+    {
+      expr = cp_parser_expression (parser);
+      parens.require_close (parser);
+    }
+  if (expr != error_mark_node)
+    expr = fold (expr);
+  tree filter_decl = NULL_TREE;
+  HOST_WIDE_INT filter_kind = 0;
+  bool dynamic_filter = false;
+  if (expr != error_mark_node && TREE_CODE (expr) == CALL_EXPR)
+    {
+      filter_decl = get_callee_fndecl (expr);
+      int nargs = call_expr_nargs (expr);
+      if (filter_decl && TREE_CODE (filter_decl) == FUNCTION_DECL
+	  && nargs == 0)
+	{
+	  filter_kind = 1;
+	  dynamic_filter = true;
+	}
+      else if (filter_decl && TREE_CODE (filter_decl) == FUNCTION_DECL
+	       && nargs == 1)
+	{
+	  tree arg = CALL_EXPR_ARG (expr, 0);
+	  STRIP_NOPS (arg);
+	  if (TREE_CODE (arg) == CALL_EXPR && call_expr_nargs (arg) == 0)
+	    {
+	      tree intrinsic = get_callee_fndecl (arg);
+	      if (intrinsic && DECL_NAME (intrinsic))
+		{
+		  const char *name = IDENTIFIER_POINTER (DECL_NAME (intrinsic));
+		  if (!strcmp (name, "_exception_info")
+		      || !strcmp (name, "exception_info"))
+		    filter_kind = 2;
+		  else if (!strcmp (name, "_exception_code")
+			   || !strcmp (name, "exception_code"))
+		    filter_kind = 3;
+		  dynamic_filter = filter_kind != 0;
+		}
+	    }
+	}
+      if (dynamic_filter
+	  && (!INTEGRAL_TYPE_P (TREE_TYPE (expr))
+	      || TYPE_PRECISION (TREE_TYPE (expr)) > 32))
+	dynamic_filter = false;
+    }
+
+  if (expr == error_mark_node
+      || (!dynamic_filter
+	  && (TREE_CODE (expr) != INTEGER_CST || !tree_fits_shwi_p (expr)
+	      || !IN_RANGE (tree_to_shwi (expr), -1, 1))))
+    {
+      error_at (loc, "C++ MinGW SEH requires a constant filter result "
+		"of -1, 0, or 1, or a direct call to a filter function");
+      cp_parser_skip_to_end_of_block_or_statement (parser);
+      cp_parser_mingw_seh_skip_clause (parser);
+      finish_compound_stmt (compound);
+      return error_mark_node;
+    }
+  HOST_WIDE_INT result = dynamic_filter ? 0 : tree_to_shwi (expr);
+  if (dynamic_filter)
+    {
+      TREE_USED (filter_decl) = 1;
+      cgraph_node::get_create (filter_decl)->mark_force_output ();
+    }
+
+  tree handler_name = get_identifier (handler + (handler[0] == '.'));
+  tree handler_label = lookup_label (handler_name);
+  TREE_USED (handler_label) = 1;
+  FORCED_LABEL (handler_label) = 1;
+  tree after_label = create_artificial_label (loc);
+  FORCED_LABEL (after_label) = 1;
+  tree labels = tree_cons (build_string (11, "seh_handler"), handler_label,
+			   NULL_TREE);
+  const char *edge_text = "jmp 1f\n\tjmp %l[seh_handler]\n1:";
+  const char *clobber_names[]
+    = { "rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
+	"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory" };
+  tree clobbers = NULL_TREE;
+  for (unsigned i = 0; i < ARRAY_SIZE (clobber_names); ++i)
+    clobbers = tree_cons (NULL_TREE,
+			  build_string (strlen (clobber_names[i]),
+					clobber_names[i]), clobbers);
+  cp_parser_add_mingw_seh_asm (loc, edge_text, nreverse (clobbers), labels);
+  add_stmt (build_stmt (loc, GOTO_EXPR, after_label));
+  finish_label_stmt (handler_name);
+  snprintf (asm_text, sizeof (asm_text), "%s:", handler);
+  cp_parser_add_mingw_seh_asm (loc, asm_text,
+			       tree_cons (NULL_TREE, build_string (6, "memory"),
+					  NULL_TREE));
+  tree handler_stmt = cp_parser_compound_statement (parser, NULL,
+						   BCS_NORMAL, false);
+  walk_tree (&handler_stmt, cp_mingw_seh_mark_handler_local,
+	     current_function_decl, NULL);
+  bool unsupported_language_eh
+    = walk_tree (TREE_CODE (compound) == BIND_EXPR
+		 ? &BIND_EXPR_BODY (compound) : &compound,
+		 cp_mingw_seh_find_language_cleanup, NULL, NULL) != NULL_TREE;
+  if (unsupported_language_eh)
+    error_at (loc, "C++ destructors and language exception handling inside "
+	      "%<__try%> are not yet supported with native Microsoft SEH");
+  add_stmt (build_stmt (loc, LABEL_EXPR, after_label));
+  finish_compound_stmt (compound);
+
+  if (unsupported_language_eh)
+    return compound;
+
+  if (!lookup_attribute ("mingw_seh_scope",
+			 DECL_ATTRIBUTES (current_function_decl)))
+    {
+      tree options = NULL_TREE;
+      const char *names[] = { "no-reorder-blocks",
+			      "no-reorder-blocks-and-partition",
+			      "no-tree-loop-optimize" };
+      for (unsigned i = 0; i < ARRAY_SIZE (names); ++i)
+	options = tree_cons (NULL_TREE,
+			     build_string (strlen (names[i]), names[i]), options);
+      decl_attributes (&current_function_decl,
+		       tree_cons (get_identifier ("optimize"),
+				  nreverse (options), NULL_TREE), 0);
+    }
+  DECL_UNINLINABLE (current_function_decl) = 1;
+  decl_attributes (&current_function_decl,
+		   tree_cons (get_identifier ("noclone"), NULL_TREE, NULL_TREE), 0);
+  tree args = NULL_TREE;
+  args = tree_cons (NULL_TREE, build_string (strlen (handler), handler), args);
+  args = tree_cons (NULL_TREE, build_string (strlen (filter), filter), args);
+  args = tree_cons (NULL_TREE, build_string (strlen (end), end), args);
+  args = tree_cons (NULL_TREE, build_string (strlen (begin), begin), args);
+  args = chainon (args, build_tree_list (NULL_TREE,
+						build_int_cst (integer_type_node,
+							       result)));
+  args = chainon (args, build_tree_list (NULL_TREE,
+						build_int_cst (integer_type_node,
+							       filter_kind)));
+  args = chainon (args, build_tree_list (NULL_TREE, filter_decl));
+  DECL_ATTRIBUTES (current_function_decl)
+    = tree_cons (get_identifier ("mingw_seh_scope"), args,
+		 DECL_ATTRIBUTES (current_function_decl));
+  return compound;
+}
+
 static void
 cp_parser_statement (cp_parser* parser, tree in_statement_expr,
 		     const bool in_compound, bool *if_p, vec<tree> *chain,
@@ -14506,30 +15000,9 @@ cp_parser_statement (cp_parser* parser, tree in_statement_expr,
 
 	case RID_SEH_TRY:
 	  {
-	  error_at (token->location,
-		    "%<__try%> is not yet supported in C++");
+	  location_t seh_loc = token->location;
 	  cp_lexer_consume_token (parser->lexer);
-	  cp_parser_skip_to_end_of_block_or_statement (parser);
-	  /* Depending on the C++ dialect's keyword table, the Microsoft
-	     spellings can arrive here as identifiers.  Consume the complete
-	     paired clause either way, so the primary unsupported-feature
-	     diagnostic does not turn into cascading errors for __except.  */
-	  cp_token *clause = cp_lexer_peek_token (parser->lexer);
-	  bool seh_clause
-	    = (clause->type == CPP_KEYWORD
-	       && (clause->keyword == RID_SEH_EXCEPT
-		   || clause->keyword == RID_SEH_FINALLY));
-	  if (clause->type == CPP_NAME
-	      && (id_equal (clause->u.value, "__except")
-		  || id_equal (clause->u.value, "__finally")))
-	    seh_clause = true;
-	  if (seh_clause)
-	    {
-	      cp_lexer_consume_token (parser->lexer);
-	      cp_parser_skip_to_end_of_balanced_tokens (parser);
-	      cp_parser_skip_to_end_of_block_or_statement (parser);
-	    }
-	  statement = error_mark_node;
+	  statement = cp_parser_mingw_seh_try_statement (parser, seh_loc);
 	  break;
 	  }
 
