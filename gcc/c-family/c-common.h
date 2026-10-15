@@ -253,6 +253,11 @@ enum rid
   RID_FIRST_INT_N = RID_INT_N_0,
   RID_LAST_INT_N = RID_INT_N_3,
 
+  /* Microsoft Structured Exception Handling statements.  */
+  RID_SEH_TRY,
+  RID_SEH_EXCEPT,
+  RID_SEH_FINALLY,
+
   RID_MAX,
 
   RID_FIRST_MODIFIER = RID_STATIC,

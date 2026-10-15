@@ -211,6 +211,8 @@ struct GTY(()) c_parser {
   bool in_pragma : 1;
   /* True if we're parsing the outermost block of an if statement.  */
   bool in_if_block : 1;
+  /* Number of lexically enclosing Microsoft SEH protected blocks.  */
+  unsigned int seh_try_depth;
   /* True if we want to lex a translated, joined string (for an
      initial #pragma pch_preprocess).  Otherwise the parser is
      responsible for concatenating strings and translating to the
@@ -1846,6 +1848,7 @@ static void c_parser_statement (c_parser *, bool *, location_t * = NULL);
 static void c_parser_statement_after_labels (c_parser *, bool *, tree,
 					     vec<tree> * = NULL,
 					     attr_state = {});
+static void c_parser_seh_try_statement (c_parser *);
 static tree c_parser_c99_block_statement (c_parser *, bool *,
 					  location_t * = NULL);
 static void c_parser_if_statement (c_parser *, bool *, vec<tree> *);
@@ -8390,6 +8393,9 @@ c_parser_statement_after_labels (c_parser *parser, bool *if_p,
 	case RID_IF:
 	  c_parser_if_statement (parser, if_p, chain);
 	  break;
+	case RID_SEH_TRY:
+	  c_parser_seh_try_statement (parser);
+	  break;
 	case RID_SWITCH:
 	  c_parser_switch_statement (parser, if_p, before_labels);
 	  break;
@@ -8403,6 +8409,8 @@ c_parser_statement_after_labels (c_parser *parser, bool *if_p,
 	  c_parser_for_statement (parser, false, 0, false, if_p, before_labels);
 	  break;
 	case RID_GOTO:
+	  if (parser->seh_try_depth)
+	    error_at (loc, "goto statement inside %<__try%> is not yet supported");
 	  c_parser_consume_token (parser);
 	  if (c_parser_next_token_is (parser, CPP_NAME))
 	    {
@@ -8425,16 +8433,22 @@ c_parser_statement_after_labels (c_parser *parser, bool *if_p,
 	    c_parser_error (parser, "expected identifier or %<*%>");
 	  goto expect_semicolon;
 	case RID_CONTINUE:
+	  if (parser->seh_try_depth)
+	    error_at (loc, "continue statement inside %<__try%> is not yet supported");
 	  c_parser_consume_token (parser);
 	  stmt = c_finish_bc_stmt (loc, objc_foreach_continue_label, false,
 				   c_parser_bc_name (parser, false));
 	  goto expect_semicolon;
 	case RID_BREAK:
+	  if (parser->seh_try_depth)
+	    error_at (loc, "break statement inside %<__try%> is not yet supported");
 	  c_parser_consume_token (parser);
 	  stmt = c_finish_bc_stmt (loc, objc_foreach_break_label, true,
 				   c_parser_bc_name (parser, true));
 	  goto expect_semicolon;
 	case RID_RETURN:
+	  if (parser->seh_try_depth)
+	    error_at (loc, "return statement inside %<__try%> is not yet supported");
 	  c_parser_consume_token (parser);
 	  if (c_parser_next_token_is (parser, CPP_SEMICOLON))
 	    {
@@ -8627,6 +8641,320 @@ c_parser_paren_condition (c_parser *parser)
   cond = c_parser_condition (parser);
   parens.skip_until_found_close (parser);
   return cond;
+}
+
+/* Add a volatile assembler statement used to delimit or describe a native
+   Windows SEH scope.  */
+
+static void
+c_parser_add_seh_asm (location_t loc, const char *text, bool memory_clobber)
+{
+  tree asm_string = build_string (strlen (text), text);
+  tree clobbers = NULL_TREE;
+  if (memory_clobber)
+    clobbers = tree_cons (NULL_TREE, build_string (6, "memory"),
+			  NULL_TREE);
+  tree stmt = build_asm_expr (loc, asm_string, NULL_TREE, NULL_TREE, clobbers,
+			      NULL_TREE, true, true);
+  build_asm_stmt (true, stmt);
+}
+
+/* Generate an assembler-local label for a native SEH scope record.  */
+
+static const char *
+c_parser_seh_new_label (const char *prefix)
+{
+  static unsigned int label_number;
+  char buffer[128];
+  ASM_GENERATE_INTERNAL_LABEL (buffer, prefix, ++label_number);
+  return ggc_strdup (buffer + (buffer[0] == '*'));
+}
+
+/* A Windows dispatcher enters an __except body asynchronously, without
+   executing the ordinary CFG edge copies.  Keep only automatic objects
+	 actually referenced by that body in canonical memory so their value at
+	 the exception point remains observable to the handler.  Do this while the
+	 frontend tree is still being built, before GIMPLE SSA promotion.  */
+static tree
+c_parser_seh_mark_handler_local (tree *tp, int *walk_subtrees, void *data)
+{
+	tree t = *tp;
+	tree function = (tree) data;
+	if (IS_TYPE_OR_DECL_P (t))
+		{
+		if ((TREE_CODE (t) == VAR_DECL || TREE_CODE (t) == PARM_DECL)
+				&& DECL_CONTEXT (t) == function && !TREE_STATIC (t)
+				&& TREE_USED (t))
+				{
+					TREE_ADDRESSABLE (t) = 1;
+					if (!lookup_attribute ("mingw_seh_handler_local",
+																 DECL_ATTRIBUTES (t)))
+						DECL_ATTRIBUTES (t)
+							= tree_cons (get_identifier ("mingw_seh_handler_local"),
+													 NULL_TREE, DECL_ATTRIBUTES (t));
+				}
+			*walk_subtrees = 0;
+		}
+	return NULL_TREE;
+}
+
+/* Save a scope record on the function declaration for the PE backend.  The
+   backend emits all records together in the function's real unwind section;
+   emitting .seh_handlerdata from inline asm loses track of the function's
+   section and cannot represent more than one scope per function.  */
+
+static void
+c_parser_seh_record_scope (tree function, const char *begin, const char *end,
+			  const char *filter, const char *handler,
+			  HOST_WIDE_INT filter_result, HOST_WIDE_INT filter_kind,
+			  tree filter_decl)
+{
+  /* Scope tables describe address ranges, but the current representation
+     stores lexical boundary labels in volatile asm.  Block layout can move
+     blocks across those labels, and loop transforms can duplicate the asm
+     (producing duplicate assembler symbols).  Until ranges are represented
+     on basic blocks and expanded after layout, disable those transforms only
+     for functions containing SEH.  */
+  if (!lookup_attribute ("mingw_seh_scope", DECL_ATTRIBUTES (function)))
+    {
+      tree options = NULL_TREE;
+      const char *no_reorder[] = { "no-reorder-blocks",
+				    "no-reorder-blocks-and-partition",
+				    "no-tree-loop-optimize" };
+      for (unsigned int i = 0; i < ARRAY_SIZE (no_reorder); ++i)
+	options = tree_cons (NULL_TREE,
+			     build_string (strlen (no_reorder[i]),
+					   no_reorder[i]),
+			     options);
+      options = nreverse (options);
+      tree attr = tree_cons (get_identifier ("optimize"), options,
+			     NULL_TREE);
+      decl_attributes (&function, attr, 0);
+    }
+
+  /* The scope table names machine-code ranges in this function.  Until the
+     GIMPLE representation can carry and clone those ranges, prevent inlining
+     this body into a caller that would not own the corresponding metadata. */
+  DECL_UNINLINABLE (function) = 1;
+
+  /* IPA constant-propagation can still create out-of-line clones despite
+     DECL_UNINLINABLE.  Those clones would copy the assembler scope labels but
+     not receive unique labels or independently emitted scope records.  Keep
+     cloning disabled until scope membership is represented in cloneable IR.  */
+  tree no_clone = tree_cons (get_identifier ("noclone"), NULL_TREE, NULL_TREE);
+  decl_attributes (&function, no_clone, 0);
+
+  tree args = NULL_TREE;
+  args = tree_cons (NULL_TREE,
+		    build_string (strlen (handler), handler), args);
+  args = tree_cons (NULL_TREE,
+		    build_string (strlen (filter), filter), args);
+  args = tree_cons (NULL_TREE, build_string (strlen (end), end), args);
+  args = tree_cons (NULL_TREE, build_string (strlen (begin), begin), args);
+	args = chainon (args,
+		  build_tree_list (NULL_TREE,
+				   build_int_cst (integer_type_node,
+						  filter_result)));
+	args = chainon (args,
+		  build_tree_list (NULL_TREE,
+				   build_int_cst (integer_type_node,
+						  filter_kind)));
+	args = chainon (args, build_tree_list (NULL_TREE, filter_decl));
+  DECL_ATTRIBUTES (function)
+    = tree_cons (get_identifier ("mingw_seh_scope"), args,
+		 DECL_ATTRIBUTES (function));
+}
+
+/* Recognize the first dynamic filter funclets supported by the native x64
+   implementation.  The filter expression must be a direct call to a C
+   function, optionally passing the current exception information or code.
+   The backend emits a tail-call thunk, so the dispatcher-provided register
+   arguments and stack frame remain intact.  */
+
+static bool
+c_parser_seh_filter_callback (tree expr, tree *filter_decl,
+			     HOST_WIDE_INT *filter_kind)
+{
+	if (TREE_CODE (expr) != CALL_EXPR)
+		return false;
+
+	tree decl = get_callee_fndecl (expr);
+	if (!decl || TREE_CODE (decl) != FUNCTION_DECL)
+		return false;
+
+	int nargs = call_expr_nargs (expr);
+	if (nargs == 0)
+		*filter_kind = 1;
+	else if (nargs == 1)
+		{
+		tree arg = CALL_EXPR_ARG (expr, 0);
+		while (CONVERT_EXPR_P (arg) || TREE_CODE (arg) == NON_LVALUE_EXPR
+		       || TREE_CODE (arg) == VIEW_CONVERT_EXPR)
+			arg = TREE_OPERAND (arg, 0);
+		if (TREE_CODE (arg) != CALL_EXPR || call_expr_nargs (arg) != 0)
+			return false;
+		tree intrinsic = get_callee_fndecl (arg);
+		if (!intrinsic || TREE_CODE (intrinsic) != FUNCTION_DECL
+				|| !DECL_NAME (intrinsic))
+			return false;
+		const char *name = IDENTIFIER_POINTER (DECL_NAME (intrinsic));
+		if (!strcmp (name, "_exception_info")
+				|| !strcmp (name, "exception_info"))
+			*filter_kind = 2;
+		else if (!strcmp (name, "_exception_code")
+				 || !strcmp (name, "exception_code"))
+			*filter_kind = 3;
+		else
+			return false;
+		}
+	else
+		return false;
+
+	if (!INTEGRAL_TYPE_P (TREE_TYPE (expr))
+			|| TYPE_PRECISION (TREE_TYPE (expr)) > 32)
+		return false;
+
+	*filter_decl = decl;
+	return true;
+}
+
+/* Parse the initial native SEH form supported by the C frontend.  Constant
+   filter results are returned by a small native thunk; the x64 OS dispatcher
+   calls it through __C_specific_handler and enters the handler label only
+   when the result requests execution.  */
+
+static void
+c_parser_seh_try_statement (c_parser *parser)
+{
+  location_t loc = c_parser_peek_token (parser)->location;
+  c_parser_consume_token (parser);
+
+  if (!flag_ms_extensions)
+    {
+      error_at (loc, "%<__try%> requires %<-fms-extensions%>");
+      c_parser_skip_to_end_of_block_or_statement (parser);
+      return;
+    }
+
+  if (!TARGET_SEH || !TARGET_64BIT)
+    {
+      error_at (loc, "%<__try%> is currently supported only for MinGW x64");
+      c_parser_skip_to_end_of_block_or_statement (parser);
+      return;
+    }
+
+  const char *try_begin = c_parser_seh_new_label ("SEH_BEGIN");
+  const char *try_end = c_parser_seh_new_label ("SEH_END");
+  const char *filter = c_parser_seh_new_label ("SEH_FILTER");
+  const char *handler = c_parser_seh_new_label ("SEH_HANDLER");
+
+  char asm_text[256];
+  snprintf (asm_text, sizeof (asm_text), "%s:", try_begin);
+  c_parser_add_seh_asm (loc, asm_text, true);
+  ++parser->seh_try_depth;
+  add_stmt (c_parser_compound_statement (parser));
+  --parser->seh_try_depth;
+  snprintf (asm_text, sizeof (asm_text), "%s:", try_end);
+  c_parser_add_seh_asm (loc, asm_text, true);
+
+  if (c_parser_peek_token (parser)->type != CPP_KEYWORD
+      || c_parser_peek_token (parser)->keyword != RID_SEH_EXCEPT)
+    {
+      if (c_parser_peek_token (parser)->type == CPP_KEYWORD
+	  && c_parser_peek_token (parser)->keyword == RID_SEH_FINALLY)
+	{
+	  error_at (c_parser_peek_token (parser)->location,
+		    "%<__finally%> is not yet supported");
+	  c_parser_skip_to_end_of_block_or_statement (parser);
+	  return;
+	}
+      error_at (c_parser_peek_token (parser)->location,
+		"expected %<__except%> after %<__try%> block");
+      return;
+    }
+  c_parser_consume_token (parser);
+
+  matching_parens filter_parens;
+  tree filter_expr = error_mark_node;
+  if (filter_parens.require_open (parser))
+    {
+      c_expr parsed_filter = c_parser_expression (parser);
+      filter_parens.skip_until_found_close (parser);
+      filter_expr = parsed_filter.value;
+    }
+  filter_expr = c_fully_fold (filter_expr, false, NULL);
+  tree filter_decl = NULL_TREE;
+  HOST_WIDE_INT filter_kind = 0;
+  bool dynamic_filter
+    = filter_expr != error_mark_node
+      && c_parser_seh_filter_callback (filter_expr, &filter_decl,
+					       &filter_kind);
+  if (filter_expr == error_mark_node
+      || (!dynamic_filter
+	  && (TREE_CODE (filter_expr) != INTEGER_CST
+	      || !tree_fits_shwi_p (filter_expr)
+	      || !IN_RANGE (tree_to_shwi (filter_expr), -1, 1))))
+    {
+      error_at (loc, "the initial MinGW x64 SEH implementation requires "
+	"a constant filter result of -1, 0, or 1, or a direct call to a "
+	"filter function with no arguments, %<_exception_code()%>, or "
+	"%<_exception_info()%>");
+      c_parser_skip_to_end_of_block_or_statement (parser);
+      return;
+    }
+  HOST_WIDE_INT filter_result
+    = dynamic_filter ? 0 : tree_to_shwi (filter_expr);
+  if (dynamic_filter)
+	{
+	  TREE_USED (filter_decl) = 1;
+	  cgraph_node::get_create (filter_decl)->mark_force_output ();
+	}
+
+  /* An ASM_GOTO edge requires a label registered in the C label namespace.  */
+  const char *handler_id = handler + (handler[0] == '.');
+  tree handler_label = define_label (loc, get_identifier (handler_id));
+  TREE_USED (handler_label) = 1;
+  FORCED_LABEL (handler_label) = 1;
+  tree after_label = create_artificial_label (loc);
+  FORCED_LABEL (after_label) = 1;
+
+  /* Tell the optimizer that the native dispatcher can enter at the SEH
+     handler label.  The first jump skips the explicit ASM_GOTO target branch
+     during normal execution while preserving a CFG edge to the handler.  */
+  tree seh_label_name = build_string (11, "seh_handler");
+  tree seh_labels = tree_cons (seh_label_name, handler_label, NULL_TREE);
+  const char *seh_goto_text = "jmp 1f\n\tjmp %l[seh_handler]\n1:";
+  /* A native dispatcher enters the handler with volatile registers clobbered
+     by calls into the OS and filter thunk.  Model that on the exceptional CFG
+     edge so optimized code does not keep values live only in caller-saved
+     registers across the handler entry.  */
+  const char *seh_clobber_names[] =
+    { "rax", "rcx", "rdx", "r8", "r9", "r10", "r11",
+      "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory" };
+  tree seh_clobbers = NULL_TREE;
+  for (unsigned int i = 0; i < ARRAY_SIZE (seh_clobber_names); ++i)
+    seh_clobbers = tree_cons
+	  (NULL_TREE,
+	   build_string (strlen (seh_clobber_names[i]), seh_clobber_names[i]),
+	   seh_clobbers);
+  tree seh_goto = build_asm_expr
+    (loc, build_string (strlen (seh_goto_text), seh_goto_text), NULL_TREE,
+     NULL_TREE, seh_clobbers, seh_labels, false, true);
+  build_asm_stmt (true, seh_goto);
+
+	add_stmt (build_stmt (loc, GOTO_EXPR, after_label));
+	add_stmt (build_stmt (loc, LABEL_EXPR, handler_label));
+	snprintf (asm_text, sizeof (asm_text), "%s:", handler);
+	c_parser_add_seh_asm (loc, asm_text, true);
+	tree handler_stmt = c_parser_compound_statement (parser);
+	walk_tree (&handler_stmt, c_parser_seh_mark_handler_local,
+						 current_function_decl, NULL);
+  add_stmt (handler_stmt);
+  add_stmt (build_stmt (loc, LABEL_EXPR, after_label));
+
+  c_parser_seh_record_scope (current_function_decl, try_begin, try_end,
+			     filter, handler, filter_result, filter_kind,
+			     filter_decl);
 }
 
 /* Parse a selection-header:

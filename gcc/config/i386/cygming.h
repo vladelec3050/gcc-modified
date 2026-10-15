@@ -449,7 +449,11 @@ do {						\
 
 #define SUBTARGET_ATTRIBUTE_TABLE \
   { "selectany", 0, 0, true, false, false, false, \
-    mingw_handle_selectany_attribute, NULL }
+    mingw_handle_selectany_attribute, NULL }, \
+  /* Internal attribute carrying native SEH scope records through LTO.  */ \
+  { "mingw_seh_scope", 7, 7, true, false, false, false, NULL, NULL }, \
+  /* Preserve handler-visible locals in memory across dispatcher entry.  */ \
+  { "mingw_seh_handler_local", 0, 0, true, false, false, false, NULL, NULL }
   /* { name, min_len, max_len, decl_req, type_req, fn_type_req,
        affects_type_identity, handler, exclude } */
 

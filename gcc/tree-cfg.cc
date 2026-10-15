@@ -384,6 +384,244 @@ make_pass_build_cfg (gcc::context *ctxt)
   return new pass_build_cfg (ctxt);
 }
 
+/* A source-level __except handler is entered by the Windows dispatcher
+   without executing a normal GIMPLE edge.  Before SSA construction, describe
+   every call in a protected region as having an abnormal successor to each
+	 lexically enclosing handler.  These are real exception transfers: the
+	 dispatcher may reject an inner scope with CONTINUE_SEARCH and select any
+	 enclosing scope.  EDGE_ABNORMAL makes SSA and out-of-SSA treat the values
+	 as context-dependent instead of inserting ordinary PHI edge copies which
+	 the Windows dispatcher would skip.  */
+
+struct mingw_seh_scope_info
+{
+	const char *begin;
+	const char *end;
+	const char *handler_name;
+	tree handler_label;
+	basic_block handler_bb;
+};
+
+static bool
+mingw_seh_asm_label_p (gimple *stmt, const char *label)
+{
+	if (!is_a <gasm *> (stmt) || gimple_asm_nlabels (as_a <gasm *> (stmt)))
+		return false;
+	const char *text = gimple_asm_string (as_a <gasm *> (stmt));
+	size_t len = strlen (label);
+	return strncmp (text, label, len) == 0 && text[len] == ':';
+}
+
+/* Calls can raise software exceptions, while a subset of non-call GIMPLE
+   statements can synchronously fault on the executing instruction (for
+   example, a memory access or a volatile asm such as UD2).  Keep this
+   predicate deliberately tied to GCC's existing trap analysis instead of
+   treating every statement as an exceptional exit.  */
+
+static bool
+mingw_seh_may_raise_p (gimple *stmt)
+{
+	return is_gimple_call (stmt) || gimple_could_trap_p (stmt);
+}
+
+/* The frontend uses volatile asm solely to pin source scope boundaries and
+   handler entries.  Those marker statements are not faulting operations.  */
+
+static bool
+mingw_seh_scope_marker_p (gimple *stmt,
+			  const auto_vec<mingw_seh_scope_info, 4> &scopes)
+{
+	for (unsigned int i = 0; i < scopes.length (); ++i)
+		if (mingw_seh_asm_label_p (stmt, scopes[i].begin)
+				|| mingw_seh_asm_label_p (stmt, scopes[i].end)
+				|| mingw_seh_asm_label_p (stmt, scopes[i].handler_name))
+			return true;
+	return false;
+}
+
+static unsigned int
+execute_mingw_seh_edges (void)
+{
+	if (!TARGET_SEH || !DECL_ATTRIBUTES (current_function_decl))
+		return 0;
+
+	/* The current PE backend cannot combine native SEH scope tables with a
+	   GCC language-EH personality.  Leave its existing diagnostic path intact
+	   and do not split or retag blocks that carry ordinary EDGE_EH arcs.  */
+	if (function_needs_eh_personality (cfun) != eh_personality_none)
+		return 0;
+
+	auto_vec<mingw_seh_scope_info, 4> scopes;
+	for (tree attr = DECL_ATTRIBUTES (current_function_decl);
+			 attr; attr = TREE_CHAIN (attr))
+		if (TREE_CODE (TREE_PURPOSE (attr)) == IDENTIFIER_NODE
+		    && is_attribute_p ("mingw_seh_scope", TREE_PURPOSE (attr)))
+			{
+				tree arg = TREE_VALUE (attr);
+				mingw_seh_scope_info scope;
+				scope.begin = TREE_STRING_POINTER (TREE_VALUE (arg));
+				arg = TREE_CHAIN (arg);
+				scope.end = TREE_STRING_POINTER (TREE_VALUE (arg));
+				arg = TREE_CHAIN (arg);
+				arg = TREE_CHAIN (arg); /* Skip filter symbol.  */
+				scope.handler_name = TREE_STRING_POINTER (TREE_VALUE (arg));
+				scope.handler_label = NULL_TREE;
+				scope.handler_bb = NULL;
+				scopes.safe_push (scope);
+			}
+
+	if (scopes.is_empty ())
+		return 0;
+
+	/* Match the handler names carried by the target metadata to the C label
+		 operands of the asm-goto which gives the optimizer the handler block.  */
+	basic_block bb;
+	FOR_EACH_BB_FN (bb, cfun)
+		for (gimple_stmt_iterator gsi = gsi_start_bb (bb);
+				 !gsi_end_p (gsi); gsi_next (&gsi))
+			{
+				gimple *stmt = gsi_stmt (gsi);
+				if (!is_a <gasm *> (stmt))
+					continue;
+				gasm *asm_stmt = as_a <gasm *> (stmt);
+				const char *text = gimple_asm_string (asm_stmt);
+				for (unsigned int i = 0; i < gimple_asm_nlabels (asm_stmt); ++i)
+					{
+						tree label = TREE_VALUE (gimple_asm_label_op (asm_stmt, i));
+						if (TREE_CODE (label) != LABEL_DECL || !DECL_NAME (label))
+							continue;
+						const char *name = IDENTIFIER_POINTER (DECL_NAME (label));
+						for (unsigned int j = 0; j < scopes.length (); ++j)
+							{
+								const char *wanted = scopes[j].handler_name;
+								if (*wanted == '.')
+									++wanted;
+								if (strcmp (name, wanted) == 0)
+									{
+										scopes[j].handler_label = label;
+										scopes[j].handler_bb = label_to_block (cfun, label);
+									}
+							}
+					}
+
+				/* A label referenced by asm-goto is not necessarily represented by
+					 a LABEL_DECL that label_to_block can resolve after CFG creation.
+					 The frontend also emits a unique marker at the actual handler
+					 entry, which is the block the Windows dispatcher enters.  */
+				for (unsigned int j = 0; j < scopes.length (); ++j)
+					{
+						const char *wanted = scopes[j].handler_name;
+						if (*wanted == '.')
+							++wanted;
+						if (strncmp (text, wanted, strlen (wanted)) == 0
+								&& text[strlen (wanted)] == ':')
+							scopes[j].handler_bb = gimple_bb (stmt);
+					}
+			}
+
+	auto_vec<unsigned int, 4> active;
+	unsigned int added_edges = 0;
+
+	for (bb = ENTRY_BLOCK_PTR_FOR_FN (cfun)->next_bb;
+			 bb != EXIT_BLOCK_PTR_FOR_FN (cfun); )
+		{
+			gimple_stmt_iterator gsi = gsi_start_bb (bb);
+			bool split = false;
+			while (!gsi_end_p (gsi))
+				{
+					gimple *stmt = gsi_stmt (gsi);
+					for (unsigned int i = 0; i < scopes.length (); ++i)
+						if (mingw_seh_asm_label_p (stmt, scopes[i].begin))
+							active.safe_push (i);
+
+					if (mingw_seh_may_raise_p (stmt)
+							&& !mingw_seh_scope_marker_p (stmt, scopes)
+							&& !active.is_empty ())
+						{
+							/* Split immediately after the potentially faulting
+							   statement so the abnormal edge describes this
+							   operation.  */
+							edge fallthrough = split_block (bb, stmt);
+							for (unsigned int i = 0; i < active.length (); ++i)
+								{
+									basic_block handler = scopes[active[i]].handler_bb;
+									if (handler)
+										{
+											make_edge (bb, handler, EDGE_ABNORMAL);
+											++added_edges;
+										}
+								}
+							bb = fallthrough->dest;
+							split = true;
+							break;
+						}
+
+					for (unsigned int i = 0; i < scopes.length (); ++i)
+						if (mingw_seh_asm_label_p (stmt, scopes[i].end))
+							{
+								for (unsigned int j = active.length (); j-- > 0; )
+									if (active[j] == i)
+										{
+											active.unordered_remove (j);
+											break;
+										}
+							}
+					gsi_next (&gsi);
+				}
+			if (!split)
+				bb = bb->next_bb;
+		}
+
+	if (dump_file && (dump_flags & TDF_DETAILS))
+		fprintf (dump_file,
+					 "Added %u native SEH abnormal edges for %u scopes\n",
+						 added_edges, scopes.length ());
+
+	/* New successors invalidate dominance information from pass_build_cfg.
+		 Drop it before cleanup_tree_cfg, which verifies cached dominators before
+		 recomputing them.  */
+  free_dominance_info (CDI_DOMINATORS);
+  free_dominance_info (CDI_POST_DOMINATORS);
+  cleanup_tree_cfg ();
+  return 0;
+}
+
+namespace {
+
+const pass_data pass_data_mingw_seh_edges =
+{
+  GIMPLE_PASS, /* type */
+  "mingw_seh_edges", /* name */
+  OPTGROUP_NONE, /* optinfo_flags */
+  TV_TREE_CFG, /* tv_id */
+  PROP_cfg, /* properties_required */
+  0, /* properties_provided */
+  0, /* properties_destroyed */
+  0, /* todo_flags_start */
+  0, /* todo_flags_finish */
+};
+
+class pass_mingw_seh_edges : public gimple_opt_pass
+{
+public:
+  pass_mingw_seh_edges (gcc::context *ctxt)
+    : gimple_opt_pass (pass_data_mingw_seh_edges, ctxt)
+  {}
+
+  unsigned int execute (function *) final override
+  {
+    return execute_mingw_seh_edges ();
+  }
+};
+
+} // anon namespace
+
+gimple_opt_pass *
+make_pass_mingw_seh_edges (gcc::context *ctxt)
+{
+  return new pass_mingw_seh_edges (ctxt);
+}
+
 
 /* Return true if T is a computed goto.  */
 

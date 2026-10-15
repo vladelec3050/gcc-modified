@@ -14504,6 +14504,21 @@ cp_parser_statement (cp_parser* parser, tree in_statement_expr,
 	  statement = cp_parser_try_block (parser);
 	  break;
 
+	case RID_SEH_TRY:
+	  error_at (token->location,
+		    "%<__try%> is not yet supported in C++");
+	  cp_lexer_consume_token (parser->lexer);
+	  cp_parser_skip_to_end_of_block_or_statement (parser);
+	  if (cp_lexer_next_token_is_keyword (parser->lexer, RID_SEH_EXCEPT)
+	      || cp_lexer_next_token_is_keyword (parser->lexer, RID_SEH_FINALLY))
+	    {
+	      cp_lexer_consume_token (parser->lexer);
+	      cp_parser_skip_to_end_of_balanced_tokens (parser);
+	      cp_parser_skip_to_end_of_block_or_statement (parser);
+	    }
+	  statement = error_mark_node;
+	  break;
+
 	case RID_NAMESPACE:
 	  /* This must be a namespace alias definition.  */
 	  if (has_std_attrs)

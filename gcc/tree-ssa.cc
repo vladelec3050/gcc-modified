@@ -1782,6 +1782,12 @@ static void
 maybe_optimize_var (tree var, bitmap addresses_taken, bitmap not_reg_needs,
 		    bitmap suitable_for_renaming)
 {
+  /* Native Windows SEH dispatch enters a handler without the ordinary CFG
+     edge copies.  Keep handler-visible locals in memory so their value at an
+     exception point is available after dispatcher entry.  */
+  if (lookup_attribute ("mingw_seh_handler_local", DECL_ATTRIBUTES (var)))
+    return;
+
   /* Global Variables, result decls cannot be changed.  */
   if (is_global_var (var)
       || TREE_CODE (var) == RESULT_DECL

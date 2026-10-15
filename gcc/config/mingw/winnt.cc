@@ -1033,7 +1033,7 @@ mingw_pe_seh_cold_init (FILE *f, const char *name)
 /* Emit an assembler directive for the end of the function.  */
 
 static void
-mingw_pe_seh_fini (FILE *f, bool cold)
+mingw_pe_seh_fini (FILE *f, bool cold, tree decl)
 {
   struct seh_frame_state *seh;
 
@@ -1044,6 +1044,94 @@ mingw_pe_seh_fini (FILE *f, bool cold)
   seh = cfun->machine->seh;
   if (cold != seh->in_cold_section)
     return;
+
+  /* A source-level SEH construct stores its scope records on DECL.  Emit
+     them through GCC's section machinery so .seh_endproc is written back to
+     the exact function section (including startup/hot/cold and custom
+     sections).  One handler and one scope table serve every __try in it.  */
+  if (decl && DECL_ATTRIBUTES (decl))
+    {
+      auto_vec<tree> seh_scopes;
+      for (tree attr = DECL_ATTRIBUTES (decl); attr; attr = TREE_CHAIN (attr))
+	if (TREE_CODE (TREE_PURPOSE (attr)) == IDENTIFIER_NODE
+	    && is_attribute_p ("mingw_seh_scope", TREE_PURPOSE (attr)))
+	  seh_scopes.safe_push (TREE_VALUE (attr));
+
+      if (!seh_scopes.is_empty ())
+	{
+	  if (function_needs_eh_personality (cfun) != eh_personality_none)
+	    {
+	      error_at (DECL_SOURCE_LOCATION (decl),
+			"native Microsoft SEH cannot yet be combined with "
+			"GCC language exception cleanup in the same function");
+	      seh_scopes.release ();
+	    }
+	  else
+	    {
+	      /* Emit filter thunks once, outside the optimizer-managed CFG.
+		Keeping these in inline asm at the lexical scope allowed block
+		duplication to emit duplicate labels at -O1 and above.  */
+	      fputs ("\tjmp 1f\n", f);
+	      for (unsigned int i = seh_scopes.length (); i-- > 0;)
+		{
+		  tree arg = seh_scopes[i];
+		  for (unsigned int j = 0; j < 2; ++j)
+		    arg = TREE_CHAIN (arg);
+		  const char *filter = TREE_STRING_POINTER (TREE_VALUE (arg));
+		  arg = TREE_CHAIN (TREE_CHAIN (arg));	/* Skip handler.  */
+		  HOST_WIDE_INT result = tree_to_shwi (TREE_VALUE (arg));
+		  HOST_WIDE_INT kind = tree_to_shwi
+		    (TREE_VALUE (TREE_CHAIN (arg)));
+		  if (kind == 0)
+		    fprintf (f, "%s:\n\tmovl $" HOST_WIDE_INT_PRINT_DEC
+			     ", %%eax\n\tret\n", filter, result);
+		  else
+		    {
+		      tree filter_decl = TREE_VALUE (TREE_CHAIN (TREE_CHAIN (arg)));
+		      gcc_assert (filter_decl && TREE_CODE (filter_decl) == FUNCTION_DECL);
+		      fprintf (f, "%s:\n", filter);
+		      if (kind == 3)
+			/* The dispatcher passes EXCEPTION_POINTERS in RCX.  Its
+			   first member points at EXCEPTION_RECORD, whose first field
+			   is the exception code.  Replace RCX with that code before
+			   tail-calling a user filter declared to accept the code.  */
+			fputs ("\tmovq (%rcx), %rax\n"
+			       "\tmovl (%rax), %ecx\n", f);
+		      else
+			gcc_assert (kind == 1 || kind == 2);
+		      fputs ("\tjmp\t", f);
+		      assemble_name (f, IDENTIFIER_POINTER
+				     (DECL_ASSEMBLER_NAME (filter_decl)));
+		      fputc ('\n', f);
+		    }
+		}
+	      fputs ("1:\n", f);
+
+	      fputs ("\t.seh_handler\t__C_specific_handler, @except\n", f);
+	      switch_to_section (exception_section);
+	      fprintf (f, "\t.long\t%u\n", seh_scopes.length ());
+
+	      /* Attributes are prepended as the parser sees scopes.  Emit in
+		 reverse order so nested, narrower ranges precede their outers.  */
+	      for (unsigned int i = seh_scopes.length (); i-- > 0;)
+		{
+		  tree arg = seh_scopes[i];
+		  const char *labels[4];
+		  for (unsigned int j = 0; j < 4; ++j, arg = TREE_CHAIN (arg))
+		    labels[j] = TREE_STRING_POINTER (TREE_VALUE (arg));
+		  /* An exception raised by a callee in the protected block is
+		     dispatched using the caller's return address.  That address
+		     equals the first byte after the call, and can be exactly the
+		     lexical end label when the call is the final statement.  Include
+		     that resume PC in the half-open Windows scope range.  */
+		  fprintf (f, "\t.rva\t%s, %s+1, %s, %s\n",
+			   labels[0], labels[1], labels[2], labels[3]);
+		}
+	      switch_to_section (current_function_section ());
+	    }
+	}
+    }
+
   XDELETE (seh);
   cfun->machine->seh = NULL;
   fputs ("\t.seh_endproc\n", f);
@@ -1410,15 +1498,15 @@ i386_pe_start_function (FILE *f, const char *name, tree decl)
 }
 
 void
-mingw_pe_end_function (FILE *f, const char *, tree)
+mingw_pe_end_function (FILE *f, const char *, tree decl)
 {
-  mingw_pe_seh_fini (f, false);
+  mingw_pe_seh_fini (f, false, decl);
 }
 
 void
-mingw_pe_end_cold_function (FILE *f, const char *, tree)
+mingw_pe_end_cold_function (FILE *f, const char *, tree decl)
 {
-  mingw_pe_seh_fini (f, true);
+  mingw_pe_seh_fini (f, true, decl);
 }
 
 #include "gt-winnt.h"
