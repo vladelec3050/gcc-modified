@@ -14505,12 +14505,25 @@ cp_parser_statement (cp_parser* parser, tree in_statement_expr,
 	  break;
 
 	case RID_SEH_TRY:
+	  {
 	  error_at (token->location,
 		    "%<__try%> is not yet supported in C++");
 	  cp_lexer_consume_token (parser->lexer);
 	  cp_parser_skip_to_end_of_block_or_statement (parser);
-	  if (cp_lexer_next_token_is_keyword (parser->lexer, RID_SEH_EXCEPT)
-	      || cp_lexer_next_token_is_keyword (parser->lexer, RID_SEH_FINALLY))
+	  /* Depending on the C++ dialect's keyword table, the Microsoft
+	     spellings can arrive here as identifiers.  Consume the complete
+	     paired clause either way, so the primary unsupported-feature
+	     diagnostic does not turn into cascading errors for __except.  */
+	  cp_token *clause = cp_lexer_peek_token (parser->lexer);
+	  bool seh_clause
+	    = (clause->type == CPP_KEYWORD
+	       && (clause->keyword == RID_SEH_EXCEPT
+		   || clause->keyword == RID_SEH_FINALLY));
+	  if (clause->type == CPP_NAME
+	      && (id_equal (clause->u.value, "__except")
+		  || id_equal (clause->u.value, "__finally")))
+	    seh_clause = true;
+	  if (seh_clause)
 	    {
 	      cp_lexer_consume_token (parser->lexer);
 	      cp_parser_skip_to_end_of_balanced_tokens (parser);
@@ -14518,6 +14531,7 @@ cp_parser_statement (cp_parser* parser, tree in_statement_expr,
 	    }
 	  statement = error_mark_node;
 	  break;
+	  }
 
 	case RID_NAMESPACE:
 	  /* This must be a namespace alias definition.  */

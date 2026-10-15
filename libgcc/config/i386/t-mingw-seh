@@ -1,0 +1,2 @@
+# Native 32-bit Microsoft SEH registration support.
+LIB2ADDEH += $(srcdir)/config/i386/mingw-seh.c

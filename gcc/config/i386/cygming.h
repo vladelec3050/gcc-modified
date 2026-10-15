@@ -31,6 +31,7 @@ along with GCC; see the file COPYING3.  If not see
   SEH enabled for all 64-bit Windows functions whenever unwind tables are
   requested so .seh_proc state stays consistent with EH emission.  */
 #define TARGET_SEH  (TARGET_64BIT && flag_unwind_tables)
+#define TARGET_SEH_X86 (!TARGET_64BIT)
 
 #undef PREFERRED_STACK_BOUNDARY_DEFAULT
 #define PREFERRED_STACK_BOUNDARY_DEFAULT \

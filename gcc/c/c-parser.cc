@@ -1849,6 +1849,7 @@ static void c_parser_statement_after_labels (c_parser *, bool *, tree,
 					     vec<tree> * = NULL,
 					     attr_state = {});
 static void c_parser_seh_try_statement (c_parser *);
+static void c_parser_seh_try_statement_x86 (c_parser *, location_t);
 static tree c_parser_c99_block_statement (c_parser *, bool *,
 					  location_t * = NULL);
 static void c_parser_if_statement (c_parser *, bool *, vec<tree> *);
@@ -8818,6 +8819,173 @@ c_parser_seh_filter_callback (tree expr, tree *filter_decl,
 	return true;
 }
 
+/* Return an external declaration for one of the small x86 registration
+   helpers in libgcc.  */
+
+static tree
+c_parser_seh_x86_runtime_decl (location_t loc, const char *name,
+			       tree result_type, int nargs)
+{
+  static tree register_decl;
+  static tree unregister_decl;
+  tree *cached_decl = !strcmp (name, "__mingw_seh_register")
+    ? &register_decl : &unregister_decl;
+  if (*cached_decl)
+    return *cached_decl;
+
+  tree arg_types = NULL_TREE;
+  for (int i = 0; i < nargs; ++i)
+    arg_types = tree_cons (NULL_TREE, ptr_type_node, arg_types);
+  if (nargs >= 2)
+    TREE_VALUE (TREE_CHAIN (arg_types)) = integer_type_node;
+  arg_types = nreverse (arg_types);
+  tree type = build_function_type (result_type, arg_types);
+  tree decl = build_decl (loc, FUNCTION_DECL, get_identifier (name), type);
+  DECL_EXTERNAL (decl) = 1;
+  TREE_PUBLIC (decl) = 1;
+  DECL_ARTIFICIAL (decl) = 1;
+  TREE_USED (decl) = 1;
+  *cached_decl = pushdecl (decl);
+  return *cached_decl;
+}
+
+/* Parse and lower a 32-bit native SEH region.  The x86 registration callback
+   currently accepts only the three constant dispositions.  */
+
+static void
+c_parser_seh_try_statement_x86 (c_parser *parser, location_t loc)
+{
+  tree protected_list = push_stmt_list ();
+  ++parser->seh_try_depth;
+  add_stmt (c_parser_compound_statement (parser));
+  --parser->seh_try_depth;
+  protected_list = pop_stmt_list (protected_list);
+
+  if (c_parser_peek_token (parser)->type != CPP_KEYWORD
+      || c_parser_peek_token (parser)->keyword != RID_SEH_EXCEPT)
+    {
+      if (c_parser_peek_token (parser)->type == CPP_KEYWORD
+	  && c_parser_peek_token (parser)->keyword == RID_SEH_FINALLY)
+	{
+	  error_at (c_parser_peek_token (parser)->location,
+		    "%<__finally%> is not yet supported on MinGW x86");
+	  c_parser_skip_to_end_of_block_or_statement (parser);
+	  return;
+	}
+      error_at (c_parser_peek_token (parser)->location,
+		"expected %<__except%> after %<__try%> block");
+      return;
+    }
+  c_parser_consume_token (parser);
+
+  matching_parens filter_parens;
+  tree filter_expr = error_mark_node;
+  if (filter_parens.require_open (parser))
+    {
+      c_expr parsed_filter = c_parser_expression (parser);
+      filter_parens.skip_until_found_close (parser);
+      filter_expr = parsed_filter.value;
+    }
+  filter_expr = c_fully_fold (filter_expr, false, NULL);
+  if (filter_expr == error_mark_node
+      || TREE_CODE (filter_expr) != INTEGER_CST
+      || !tree_fits_shwi_p (filter_expr)
+      || !IN_RANGE (tree_to_shwi (filter_expr), -1, 1))
+    {
+      error_at (loc, "the initial MinGW x86 SEH implementation requires "
+	"a constant filter result of -1, 0, or 1");
+      c_parser_skip_to_end_of_block_or_statement (parser);
+      return;
+    }
+
+  const char *handler = c_parser_seh_new_label ("SEH_X86_HANDLER");
+  const char *handler_id = handler + (handler[0] == '.');
+  tree handler_label = define_label (loc, get_identifier (handler_id));
+  TREE_USED (handler_label) = 1;
+  FORCED_LABEL (handler_label) = 1;
+  tree after_label = create_artificial_label (loc);
+  FORCED_LABEL (after_label) = 1;
+
+  tree handler_list = push_stmt_list ();
+  add_stmt (c_parser_compound_statement (parser));
+  handler_list = pop_stmt_list (handler_list);
+
+  /* The native dispatcher can enter the handler without executing the CFG
+     copies on the ordinary edge.  Keep referenced locals in memory and add
+     an asm-goto edge so the SSA/CFG passes know about this entry.  */
+  walk_tree (&handler_list, c_parser_seh_mark_handler_local,
+	     current_function_decl, NULL);
+
+  tree options = NULL_TREE;
+  const char *no_reorder[] = { "no-reorder-blocks",
+				"no-reorder-blocks-and-partition",
+				"no-omit-frame-pointer" };
+  for (unsigned int i = 0; i < ARRAY_SIZE (no_reorder); ++i)
+    options = tree_cons (NULL_TREE,
+			 build_string (strlen (no_reorder[i]), no_reorder[i]),
+			 options);
+  options = nreverse (options);
+  decl_attributes (&current_function_decl,
+		   tree_cons (get_identifier ("optimize"), options, NULL_TREE), 0);
+  DECL_UNINLINABLE (current_function_decl) = 1;
+  decl_attributes (&current_function_decl,
+		   tree_cons (get_identifier ("noclone"), NULL_TREE, NULL_TREE), 0);
+
+  tree frame_type = build_array_type_nelts (unsigned_char_type_node, 24);
+  tree frame = create_tmp_var (frame_type, "seh_registration");
+  TREE_ADDRESSABLE (frame) = 1;
+
+  tree frame_address = fold_convert
+    (ptr_type_node,
+     build1 (ADDR_EXPR, build_pointer_type (frame_type), frame));
+  tree inputs = build_tree_list
+    (build_tree_list (NULL_TREE, build_string (1, "r")), frame_address);
+  const char *save_text = "movl %%esp, 16(%0)\n\tmovl %%ebp, 20(%0)";
+  tree save_asm = build_asm_expr
+    (loc, build_string (strlen (save_text), save_text), NULL_TREE, inputs,
+     tree_cons (NULL_TREE, build_string (6, "memory"), NULL_TREE),
+     NULL_TREE, false, true);
+  tree runtime_register
+    = c_parser_seh_x86_runtime_decl (loc, "__mingw_seh_register",
+				     void_type_node, 3);
+  tree register_call = build_call_expr_loc
+    (loc, runtime_register, 3, frame_address,
+     build_int_cst (integer_type_node, tree_to_shwi (filter_expr)),
+     fold_convert (ptr_type_node,
+		   build1 (ADDR_EXPR, ptr_type_node, handler_label)));
+  tree runtime_unregister
+    = c_parser_seh_x86_runtime_decl (loc, "__mingw_seh_unregister",
+				     void_type_node, 1);
+  tree unregister_call = build_call_expr_loc
+    (loc, runtime_unregister, 1, frame_address);
+
+  tree labels = tree_cons (build_string (11, "seh_handler"),
+			   handler_label, NULL_TREE);
+  const char *edge_text = "jmp 1f\n\tjmp %l[seh_handler]\n1:";
+  tree clobbers = NULL_TREE;
+  const char *clobber_names[] = { "eax", "ecx", "edx", "memory" };
+  for (unsigned int i = 0; i < ARRAY_SIZE (clobber_names); ++i)
+    clobbers = tree_cons
+      (NULL_TREE, build_string (strlen (clobber_names[i]), clobber_names[i]),
+       clobbers);
+  tree edge_asm = build_asm_expr
+    (loc, build_string (strlen (edge_text), edge_text), NULL_TREE, NULL_TREE,
+     clobbers, labels, false, true);
+
+  tree stmt_list = push_stmt_list ();
+  add_stmt (build_asm_stmt (true, save_asm));
+  add_stmt (register_call);
+  add_stmt (protected_list);
+  add_stmt (unregister_call);
+  add_stmt (build_asm_stmt (true, edge_asm));
+  add_stmt (build_stmt (loc, GOTO_EXPR, after_label));
+  add_stmt (build_stmt (loc, LABEL_EXPR, handler_label));
+  add_stmt (handler_list);
+  add_stmt (build_stmt (loc, LABEL_EXPR, after_label));
+  stmt_list = pop_stmt_list (stmt_list);
+  add_stmt (stmt_list);
+}
+
 /* Parse the initial native SEH form supported by the C frontend.  Constant
    filter results are returned by a small native thunk; the x64 OS dispatcher
    calls it through __C_specific_handler and enters the handler label only
@@ -8838,7 +9006,16 @@ c_parser_seh_try_statement (c_parser *parser)
 
   if (!TARGET_SEH || !TARGET_64BIT)
     {
-      error_at (loc, "%<__try%> is currently supported only for MinGW x64");
+#ifdef TARGET_SEH_X86
+      if (TARGET_PECOFF && TARGET_SEH_X86)
+	{
+	  /* x86 uses the native FS:[0] registration chain.  Its frame layout and
+	     dispatch protocol are unrelated to the x64 .pdata/.xdata format.  */
+	  c_parser_seh_try_statement_x86 (parser, loc);
+	  return;
+	}
+#endif
+      error_at (loc, "%<__try%> is currently supported only for MinGW x86 and x64");
       c_parser_skip_to_end_of_block_or_statement (parser);
       return;
     }
